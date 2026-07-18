@@ -8,6 +8,7 @@ Confidence (a hint strength, not authority): ★ noise/unverified · ★★ sing
 ## dense GEMM
 - [gfx950 · vLLM MXFP8 E8M0 decode-bound] dense-linear split-K/fused decode-tile Triton rewrite ★★★ **+21.8% e2e (verified, gsm8k-clean); decode-driven (converts only at high conc); grouped-MoE GEMM resists (~1.1× ceiling)** — (mxfp8-linear-decode-rewrite-gfx950.md)
 - [gfx942 · sglang bf16] aiter per-shape DB tune ★★★ **+2.23% e2e (verified)** — (aiter-bf16-tuned-gemm-gfx942.md)
+- [gfx950 · sglang fp8 a8w8 blockscale] **live path is ALREADY CK `gemm_a8w8_blockscale_bpreshuffle`** (untuned default) → env-only CK per-shape tile tune (`AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE`, ZERO HBM, NO code overlay). ★★★ iso 1.5-1.73× prefill M≥4096; +8-15% e2e verified (conc256, scales w/ prefill share); decode ~1.0× — (fp8-a8w8-blockscale-bpreshuffle-tune-gfx950.md)
 - [gfx942 · sglang fp8 a8w8 blockscale] **MANDATED LEVER = the CK skill** `gemm_tuning/fp8_gemm_tuning_sglang_aiter.md` (capture live (M,N,K) → aiter CK tuner → fp8_utils Triton→CK switch overlay + `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE`); baseline = the UNTUNED Triton default, so CK-tuned is the real win. The old per-(N,K) Triton config-JSON overlay is **DEPRECATED for this op (do NOT use it — it keeps the slow Triton seam live and bypasses the skill)** — (fp8-a8w8-blockscale-overlay-gfx942.md)
 - [gfx950 · vLLM MXFP8 E8M0] dense `tl.dot_scaled` STATIC tiles (decode BK256/prefill BM128) ★★★ part of +12.1% e2e — (mxfp8-microscale-gemm-gfx950.md)
 
@@ -20,6 +21,7 @@ Confidence (a hint strength, not authority): ★ noise/unverified · ★★ sing
 - [gfx942 · sglang hybrid prefill] `--attention-backend triton` cheap flag win ★★★ +~5% e2e — (attention-backend-triton-gfx942.md)
 - [gfx942 · vLLM decode/prefill, pow2+non-pow2 KV block, +MLA TRITON_MLA, +0.21 UNIFIED_ATTENTION] live=editable in-tree Triton → Tier-C rewrite (pow2 ROCm/CK→author); op bake-off N/A ★★★ ~+1-4% — (paged-attn-nonpow2-gfx942.md)
 - [gfx950 · vLLM block-sparse NSA GQA prefill] custom kernel, no lib swap; live = editable in-tree Triton → Tier-C rewrite ★★ ~5.6% head — (sparse-attn-nsa-triton-gfx950.md)
+- [gfx950 · sglang fp8-KV paged DECODE] live = aiter asm ll4mi (non-editable); op bake-off server-flag delegated → Tier-C author-Triton (route=author), decode buckets {1,256}, HIP-graph-safe ★★ 54.2% head, e2e transfer PENDING — (paged-attn-decode-aiter-asm-sglang-gfx950.md)
 
 ## linear-attention / FLA / mamba (editable Triton)
 - [gfx942 · prefill-dominated hybrid] stack-and-compound cluster; Amdahl pre-dispatch screen ★★★ — (editable-triton-cluster-amdahl.md)
