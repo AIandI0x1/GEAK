@@ -359,6 +359,10 @@ def build_prompt(ps_args: dict) -> str:
         "Invoke the Workflow tool exactly once with:\n"
         f'  scriptPath: "{E2E_SCRIPT}"\n'
         f"  args: {json.dumps(ps_args)}\n"
+        "CRITICAL: pass `args` as a real JSON OBJECT (a mapping), NOT as a "
+        "JSON-encoded string. Do not wrap it in quotes or call json.dumps on it. "
+        "If args arrives as a string the workflow cannot read args.workflow_dir "
+        "and aborts immediately.\n"
         "Run the full e2e pipeline (Setup -> Profile -> Strategize -> "
         "HeadKernel -> Milestone -> Finalize -> Report -> Validate). The workflow "
         f'persists its full return value to "{eval_dir}/workflow_return.json" as '
@@ -1203,9 +1207,15 @@ def normalize_result(h: dict, wf: dict) -> dict:
         "bench_script": str(eval_dir / "bench_e2e.sh"),
         "final_patch": str(eval_dir / "final" / "final_patch.diff"),
         "final_overlay": wf.get("final_overlay") or str(eval_dir / "final" / "overlay"),
-        # Measurement basis: reports aggregate output tok/s (not per-GPU),
-        # matching Hyperloom's Magpie output_throughput. See run_e2e.md alignment table.
-        "metric_basis": "aggregate_output_tok_s",
+        # Measurement basis: read back from the bench_summary.json that actually produced these numbers
+        # (bench_e2e.sh records "aggregate_output_tok_s" or "aggregate_total_token_tok_s" per E2E_METRIC),
+        # so the label never lies about the basis. Falls back to output when neither summary carries it.
+        # See run_e2e.md alignment table.
+        "metric_basis": (
+            final_summary.get("metric_basis")
+            or baseline_summary.get("metric_basis")
+            or "aggregate_output_tok_s"
+        ),
         # Which bench client measured these numbers. "inferencex" => identical
         # client to Hyperloom/Magpie (benchmark_serving.py); "native" => the
         # backend's own client (small cross-harness differences may remain).
