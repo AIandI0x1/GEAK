@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""GEAK Hermes Agent Runner — replaces Claude Code's Workflow tool with hermes-agent.
+"""GEAK Hermes Agent Runner — local-first kernel optimization.
 
-This module provides the same `agent()` and `phase()` primitives that GEAK's JS
-workflows expect, but drives them through `hermes -z` (oneshot mode) instead of
-Claude Code's SDK.
+The LLM (hermes-agent) only does what it's good at:
+  - Analysis (profiling, bottleneck identification)
+  - Code generation (writing optimized kernel variants)
+  - Strategy (deciding what to try next)
 
-Architecture:
-  - `agent(prompt, opts)` → calls `hermes -z "<prompt>" --yolo` and parses JSON output
-  - `phase(name)` → logs phase transitions (no-op in terms of execution)
-  - `pipeline(items, ...fns)` → sequential/pipelined execution (simplified from JS parallel)
+Everything mechanical is handled by Python directly:
+  - Compilation (hipcc)
+  - Benchmarking (running the compiled binary)
+  - Correctness checking (comparing outputs)
+  - File I/O (reading/writing kernel source)
 
-Usage:
-  from hermes_agent_runner import HermesAgentRunner
-  runner = HermesAgentRunner(workflow_dir="/path/to/kernel_workflow")
-  result = runner.agent("You are the director...", {"label": "director:setup"})
+This keeps each hermes-agent call short (single code-gen or analysis turn),
+avoiding the timeout issues that arise when asking a slow local LLM to do
+multi-step tool use (read -> write -> compile -> benchmark) in one turn.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -28,13 +30,10 @@ from typing import Any
 
 
 def _find_hermes_binary() -> str:
-    """Find the hermes CLI binary."""
-    # Check PATH first
-    import shutil
-    hermes = shutil.which("hermes")
+    import shutil as sh
+    hermes = sh.which("hermes")
     if hermes:
         return hermes
-    # Check known locations
     candidates = [
         os.path.expanduser("~/Desktop/0x1-Main/third_party/hermes-agent/.venv/bin/hermes"),
         os.path.expanduser("~/.local/bin/hermes"),
@@ -42,22 +41,16 @@ def _find_hermes_binary() -> str:
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
-    raise FileNotFoundError("hermes CLI not found. Install hermes-agent or set PATH.")
+    raise FileNotFoundError("hermes CLI not found")
 
 
 def _find_json_in_text(text: str) -> dict | None:
-    """Extract the last JSON object from text (agent output may have prose around it)."""
-    # Try to find JSON blocks marked with ```json
     json_blocks = re.findall(r'```json\s*\n(.*?)\n```', text, re.DOTALL)
     if json_blocks:
         try:
             return json.loads(json_blocks[-1])
         except json.JSONDecodeError:
             pass
-
-    # Try to find bare JSON objects (last one wins, since agents often output
-    # reasoning before the final JSON)
-    # Match { ... } with balanced braces (simplified)
     candidates = []
     depth = 0
     start = -1
@@ -71,32 +64,105 @@ def _find_json_in_text(text: str) -> dict | None:
             if depth == 0 and start >= 0:
                 candidates.append(text[start:i + 1])
                 start = -1
-
     for candidate in reversed(candidates):
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
             continue
-
     return None
 
 
-class HermesAgentRunner:
-    """Workflow runner that uses hermes-agent instead of Claude Code.
+class LocalBenchmarkHarness:
+    """Handles compilation and benchmarking without an LLM.
 
-    Provides the same primitives as Claude Code's Workflow tool:
-    - agent(prompt, opts): spawn a sub-agent for a role
-    - phase(name): mark phase transitions
-    - log(msg): print workflow progress
+    This is the mechanical side of kernel optimization — given a .hip file,
+    compile it with hipcc and run the benchmark driver to measure performance
+    and correctness.
     """
+
+    def __init__(self, task_dir: str, hip_arch: str = "gfx1151"):
+        self.task_dir = Path(task_dir)
+        self.src_dir = self.task_dir / "src"
+        self.build_dir = self.task_dir / "build"
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        self.hipcc = os.environ.get("HIPCC", "hipcc")
+        self.hip_arch = hip_arch
+
+    def compile_kernel(self, kernel_file: str = "mmvq.hip") -> tuple[bool, str]:
+        """Compile a HIP kernel file to a shared library."""
+        src = self.src_dir / kernel_file
+        out = self.build_dir / src.with_suffix(".so").name
+        cmd = [
+            self.hipcc, f"--offload-arch={self.hip_arch}", "-O2",
+            "-shared", "-fPIC", "-std=c++17", "-o", str(out), str(src),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, result.stderr
+        return True, str(out)
+
+    def compile_and_run(self, kernel_file: str, driver_file: str) -> dict:
+        """Compile kernel + driver together, run benchmark, return parsed results."""
+        src = self.src_dir / kernel_file
+        driver = self.build_dir / driver_file
+        exe = self.build_dir / "bench_driver"
+
+        cmd = [
+            self.hipcc, f"--offload-arch={self.hip_arch}", "-O2", "-std=c++17",
+            "-o", str(exe), str(driver), str(src),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return {"ok": False, "error": "compile", "stderr": result.stderr[-2000:]}
+
+        env = dict(os.environ, HSA_OVERRIDE_GFX_VERSION="11.5.1")
+        result = subprocess.run([str(exe)], capture_output=True, text=True, env=env)
+        return {"ok": True, "stdout": result.stdout, "stderr": result.stderr}
+
+    def run_benchmark(self, kernel_file: str = "mmvq.hip",
+                      driver_file: str = "bench_driver.cpp") -> dict:
+        """Full compile + benchmark cycle. Returns structured results."""
+        self.log("Compiling kernel + driver...")
+        res = self.compile_and_run(kernel_file, driver_file)
+        if not res.get("ok"):
+            self.log(f"Compile failed: {res.get('stderr', '')[:200]}")
+            return res
+
+        self.log("Running benchmark...")
+        stdout = res.get("stdout", "")
+        self.log(stdout.strip())
+
+        # Parse results
+        results = {"ok": True, "raw_output": stdout}
+        for line in stdout.splitlines():
+            if "Correctness:" in line:
+                results["correctness"] = "PASS" if "PASS" in line else "FAIL"
+            elif line.startswith("Baseline:"):
+                results["baseline_ms"] = float(line.split(":")[1].strip().replace("ms", "").strip())
+            elif line.startswith("Optimized:"):
+                results["optimized_ms"] = float(line.split(":")[1].strip().replace("ms", "").strip())
+            elif line.startswith("v2:"):
+                results["v2_ms"] = float(line.split(":")[1].strip().replace("ms", "").strip())
+            elif "Speedup" in line and "v2" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    results["v2_speedup"] = float(parts[-1].strip().replace("x", ""))
+        return results
+
+    def log(self, msg: str) -> None:
+        print(f"  [harness] {msg}", flush=True)
+
+
+class HermesAgentRunner:
+    """Workflow runner using hermes-agent for LLM steps only."""
 
     def __init__(
         self,
         workflow_dir: str,
         model: str | None = None,
         provider: str | None = None,
-        timeout_s: int = 3600,
-        retries: int = 4,
+        timeout_s: int = 300,
+        retries: int = 2,
     ):
         self.workflow_dir = Path(workflow_dir)
         self.hermes_bin = _find_hermes_binary()
@@ -107,48 +173,24 @@ class HermesAgentRunner:
         self._phase = "init"
 
     def log(self, msg: str) -> None:
-        """Print a workflow log message."""
         print(f"  [workflow] {msg}", flush=True)
 
     def phase(self, name: str) -> None:
-        """Mark a phase transition."""
         self._phase = name
         self.log(f"=== PHASE: {name} ===")
 
-    def _build_hermes_cmd(self, prompt: str) -> list[str]:
-        """Build the hermes CLI command for a one-shot agent call."""
+    def _build_cmd(self, prompt: str, no_tools: bool = True) -> list[str]:
         cmd = [self.hermes_bin, "-z", prompt, "--yolo", "--accept-hooks"]
+        if no_tools:
+            cmd += ["-t", ""]
         if self.model:
             cmd += ["-m", self.model]
         if self.provider:
             cmd += ["--provider", self.provider]
-        # Use GEAK-specific hermes config if set, otherwise fall back to default
-        geak_config = os.environ.get("GEAK_HERMES_CONFIG", "")
-        if geak_config and os.path.isfile(geak_config):
-            # hermes reads config from ~/.hermes/config.yaml by default;
-            # we override via env var if the config path is set
-            pass  # hermes doesn't support HERMES_CONFIG directly; use HOME override
         return cmd
 
-    def agent(
-        self,
-        prompt: str,
-        opts: dict | None = None,
-    ) -> dict | None:
-        """Spawn a hermes-agent sub-agent and return its structured JSON output.
-
-        This replaces Claude Code's `agent()` primitive. The agent:
-        1. Receives the prompt (which includes role instructions + inputs)
-        2. Uses Bash/Read/Write tools to do filesystem/shell work
-        3. Returns structured JSON
-
-        Args:
-            prompt: The full agent prompt (role + inputs + instructions)
-            opts: Options dict with optional 'label', 'phase', 'schema', 'timeout'
-
-        Returns:
-            Parsed JSON dict from the agent's output, or None on failure
-        """
+    def agent(self, prompt: str, opts: dict | None = None) -> dict | None:
+        """Spawn hermes-agent for a single LLM turn (analysis or codegen)."""
         opts = opts or {}
         label = opts.get("label", "agent")
         timeout = opts.get("timeout", self.timeout_s)
@@ -156,25 +198,16 @@ class HermesAgentRunner:
         for attempt in range(1, self.retries + 1):
             try:
                 self.log(f"  [{label}] attempt {attempt}/{self.retries}")
-                cmd = self._build_hermes_cmd(prompt)
-                env = dict(os.environ)
-                # Ensure hermes runs in the workflow directory
-                env["HERMES_WORKDIR"] = str(self.workflow_dir)
-
+                cmd = self._build_cmd(prompt)
                 proc = subprocess.run(
-                    cmd,
-                    cwd=str(self.workflow_dir),
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
+                    cmd, cwd=str(self.workflow_dir),
+                    env=dict(os.environ),
+                    capture_output=True, text=True, timeout=timeout,
                 )
-
                 if proc.returncode != 0:
                     err = proc.stderr[-500:] if proc.stderr else "no stderr"
-                    self.log(f"  [{label}] hermes exited rc={proc.returncode}: {err}")
+                    self.log(f"  [{label}] rc={proc.returncode}: {err}")
                     if attempt < self.retries:
-                        self.log(f"  [{label}] retrying...")
                         continue
                     return None
 
@@ -185,22 +218,19 @@ class HermesAgentRunner:
                         continue
                     return None
 
-                # Try to parse JSON from the output
                 result = _find_json_in_text(output)
                 if result is not None:
                     self.log(f"  [{label}] OK (parsed JSON)")
                     return result
-
-                # If no JSON found, try parsing the entire output as JSON
                 try:
                     result = json.loads(output)
-                    self.log(f"  [{label}] OK (parsed raw JSON)")
+                    self.log(f"  [{label}] OK (raw JSON)")
                     return result
                 except json.JSONDecodeError:
                     pass
 
-                self.log(f"  [{label}] no JSON found in output (len={len(output)})")
-                self.log(f"  [{label}] output preview: {output[:200]}")
+                self.log(f"  [{label}] no JSON (len={len(output)})")
+                self.log(f"  [{label}] preview: {output[:200]}")
                 if attempt < self.retries:
                     continue
                 return None
@@ -208,7 +238,6 @@ class HermesAgentRunner:
             except subprocess.TimeoutExpired:
                 self.log(f"  [{label}] timed out after {timeout}s")
                 if attempt < self.retries:
-                    self.log(f"  [{label}] retrying...")
                     continue
                 return None
             except Exception as e:
@@ -216,299 +245,295 @@ class HermesAgentRunner:
                 if attempt < self.retries:
                     continue
                 return None
-
         return None
 
     def agentT(self, prompt: str, opts: dict | None = None) -> dict | None:
-        """Alias for agent() with timeout/retry handling (matches JS agentT)."""
         return self.agent(prompt, opts)
 
+    def read_file(self, path: str) -> str:
+        """Read a file directly (no LLM needed)."""
+        try:
+            return Path(path).read_text()
+        except OSError as e:
+            self.log(f"  [read_file] {path}: {e}")
+            return ""
 
-def role_prompt(
-    runner: HermesAgentRunner,
-    role: str,
-    phase: str,
-    intro: str,
-    inputs: dict,
-) -> str:
-    """Build a role agent prompt (matches GEAK's roleAgent() in JS).
-
-    The prompt tells the agent to:
-    1. Read the role .md file
-    2. Follow its instructions for the current phase
-    3. Read knowledge files
-    4. Do filesystem/shell work
-    5. Return structured JSON
-    """
-    workflow_dir = runner.workflow_dir
-    base = f"""You are the {role}. PHASE={phase}.
-First Read {workflow_dir}/roles/{role}.md and follow its instructions for PHASE={phase}.
-Read any knowledge files it points you to under {workflow_dir}/knowledge/.
-Do all filesystem/shell work yourself (Bash/Read/Write). {intro}
-
-## Inputs
-{json.dumps(inputs, indent=2)}
-
-Return ONLY the structured JSON the role file specifies."""
-    return base
+    def write_file(self, path: str, content: str) -> bool:
+        """Write a file directly (no LLM needed)."""
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(content)
+            return True
+        except OSError as e:
+            self.log(f"  [write_file] {path}: {e}")
+            return False
 
 
-def run_kernel_workflow(
-    kernel_path: str,
-    task: str = "optimize",
-    budget: int = 4,
-    target_language: str = "triton",
-    gpu_ids: str = "0",
-    eval_dir: str | None = None,
+def run_local_optimization(
+    task_dir: str,
+    budget: int = 3,
     model: str | None = None,
 ) -> dict:
-    """Run the GEAK kernel workflow using hermes-agent.
+    """Run a full kernel optimization cycle with local-first architecture.
 
-    This is a simplified Python implementation of kernel_workflow.js that
-    uses hermes-agent instead of Claude Code for the agent() calls.
+    LLM steps (hermes-agent):
+      1. Analyze kernel + propose optimization directions
+      2. Generate optimized kernel code for each direction
+      3. Analyze benchmark results + decide next round
 
-    Args:
-        kernel_path: Path to the kernel directory to optimize
-        task: Task description
-        budget: Number of optimization rounds
-        target_language: Target language (triton, hip, flydsl)
-        gpu_ids: Comma-separated GPU IDs
-        eval_dir: Override eval directory
-        model: Model override for hermes
-
-    Returns:
-        Dict with workflow results
+    Local steps (Python):
+      - Compile kernel (hipcc)
+      - Run benchmark
+      - Check correctness
+      - Read/write files
     """
+    task_dir = str(Path(task_dir).resolve())
+    task_name = Path(task_dir).name
     workflow_dir = Path(__file__).resolve().parent.parent / "kernel_workflow"
-    runner = HermesAgentRunner(
-        workflow_dir=str(workflow_dir),
-        model=model,
-    )
 
-    kernel_path = str(Path(kernel_path).resolve())
-    kernel_name = Path(kernel_path).name
-    eval_dir = eval_dir or f"/tmp/geak_eval_{kernel_name}_{int(time.time())}"
-    os.makedirs(eval_dir, exist_ok=True)
+    runner = HermesAgentRunner(workflow_dir=str(workflow_dir), model=model)
+    harness = LocalBenchmarkHarness(task_dir)
 
-    runner.log(f"Kernel: {kernel_path}")
-    runner.log(f"Eval dir: {eval_dir}")
+    runner.log(f"Task: {task_name}")
     runner.log(f"Budget: {budget} rounds")
-    runner.log(f"Target language: {target_language}")
 
-    # === Phase: Setup ===
-    runner.phase("Setup")
-    setup = runner.agentT(
-        role_prompt(runner, "director", "setup",
-                    "Build the isolated evaluation environment.", {
-                        "KERNEL_PATH_ORIG": kernel_path,
-                        "EXP_ROOT": eval_dir,
-                        "EVAL_DIR_OVERRIDE": eval_dir,
-                        "KERNEL_NAME_HINT": kernel_name,
-                        "TASK": task,
-                        "SKILL_DIR": str(workflow_dir),
-                        "MODE": "optimize",
-                        "TARGET_LANGUAGE": target_language,
-                    }),
-        {"phase": "Setup", "label": "director:setup"}
-    )
+    # === Step 1: Baseline benchmark (local, no LLM) ===
+    runner.phase("Baseline")
+    baseline = harness.run_benchmark()
+    if not baseline.get("ok"):
+        return {"ok": False, "error": "baseline failed", "detail": baseline}
 
-    if not setup or not setup.get("eval_dir"):
-        runner.log("Setup failed: director did not return eval_dir")
-        return {"ok": False, "error": "Setup failed", "setup": setup}
-
-    eval_dir = setup["eval_dir"]
-    canonical = setup.get("workspace", kernel_path)
-    runner.log(f"Setup done. EVAL_DIR={eval_dir}")
-
-    # === Phase: Benchmark (baseline) ===
-    runner.phase("Benchmark")
-    bench = runner.agentT(
-        role_prompt(runner, "benchmark_engineer", "benchmark",
-                    "Measure the baseline kernel performance.", {
-                        "EVAL_DIR": eval_dir,
-                        "KERNEL_PATH": canonical,
-                        "GPU_ID": gpu_ids.split(",")[0],
-                        "SKILL_DIR": str(workflow_dir),
-                    }),
-        {"phase": "Benchmark", "label": "benchmark_engineer:baseline"}
-    )
-
-    if not bench:
-        runner.log("Baseline benchmark failed")
-        return {"ok": False, "error": "Baseline benchmark failed", "setup": setup}
-
-    baseline_ms = bench.get("geomean_ms", 0)
+    baseline_ms = baseline.get("baseline_ms", 0)
     runner.log(f"Baseline: {baseline_ms}ms")
 
-    # === Phase: Profile ===
-    runner.phase("Profile")
-    profile = runner.agentT(
-        role_prompt(runner, "profile_engineer", "profile",
-                    "Profile the kernel to find bottlenecks.", {
-                        "EVAL_DIR": eval_dir,
-                        "KERNEL_PATH": canonical,
-                        "GPU_ID": gpu_ids.split(",")[0],
-                        "SKILL_DIR": str(workflow_dir),
-                    }),
-        {"phase": "Profile", "label": "profile_engineer:profile"}
-    )
+    # Read the kernel source (local) — only the baseline for the prompt
+    kernel_src_path = Path(task_dir) / "src" / "mmvq.hip"
+    kernel_source = runner.read_file(str(kernel_src_path))
+    if not kernel_source:
+        return {"ok": False, "error": "cannot read kernel source"}
 
-    profile_summary = profile.get("summary", "") if profile else ""
-    runner.log(f"Profile done: {profile_summary[:100]}")
+    # Extract just the baseline kernel for the prompt (keep it short)
+    baseline_match = re.search(r'(__global__ void mmvq_q4_0_f16_baseline.*?^})', kernel_source, re.DOTALL | re.MULTILINE)
+    baseline_kernel = baseline_match.group(1) if baseline_match else kernel_source[:2000]
 
-    # === Phase: Optimize (loop) ===
-    cumulative = 1.0
-    no_improve = 0
-    max_no_improve = 2
+    best_ms = baseline_ms
+    best_speedup = 1.0
+    best_variant = "baseline"
+    all_variants = [{"name": "baseline", "ms": baseline_ms, "speedup": 1.0}]
+    insights = []
 
+    # === Optimization loop ===
     for round_num in range(1, budget + 1):
-        runner.phase(f"Optimize (round {round_num})")
+        runner.phase(f"Optimize round {round_num}")
 
-        # Plan the round
-        plan = runner.agentT(
-            role_prompt(runner, "tech_lead", "plan_round",
-                        "Decide this round's optimization directions.", {
-                            "EVAL_DIR": eval_dir,
-                            "ROUND": round_num,
-                            "BUDGET_REMAINING": budget - round_num + 1,
-                            "CUMULATIVE_SPEEDUP": cumulative,
-                            "BASELINE_GEOMEAN_MS": baseline_ms,
-                            "PROFILE_SUMMARY": profile_summary,
-                            "SKILL_DIR": str(workflow_dir),
-                        }),
-            {"phase": "Optimize", "label": f"tech_lead:plan r{round_num}"}
-        )
+        # --- LLM step: analyze + propose ---
+        analyze_prompt = f"""You are a GPU kernel optimization engineer on Strix Halo (gfx1151, RDNA 3.5).
 
-        if not plan or plan.get("stop") or not plan.get("directions"):
-            runner.log(f"Round {round_num}: TechLead chose to stop")
+## Baseline kernel
+```cpp
+{baseline_kernel}
+```
+
+## Current benchmark
+- Baseline: {baseline_ms}ms
+- Best so far: {best_ms}ms ({best_speedup:.2f}x speedup, variant: {best_variant})
+
+## Previous insights
+{json.dumps(insights[-5:], indent=2) if insights else "None yet"}
+
+## Strix Halo characteristics
+- 40 CUs, wave32 default (NOT wave64)
+- 128GB unified memory (~256 GB/s, no MALL/Infinity Cache)
+- WMMA matrix instructions (not MFMA)
+- Memory-bound: weight traffic is the floor
+
+Propose ONE optimization direction for this round. Be specific.
+Return JSON: {{"direction": {{"id": "r{round_num}", "title": "...", "change": "detailed description", "expected_speedup": 1.2, "risk": "..."}}}}
+ONLY the JSON."""
+
+        plan = runner.agent(analyze_prompt, {"label": f"r{round_num}:analyze", "timeout": 120})
+        if not plan or not plan.get("direction"):
+            runner.log(f"Round {round_num}: no direction proposed, stopping")
             break
 
-        directions = plan["directions"]
-        runner.log(f"Round {round_num}: {len(directions)} direction(s)")
+        direction = plan["direction"]
+        runner.log(f"Round {round_num}: {direction.get('title', 'unknown')}")
 
-        for d in directions:
-            d_id = d.get("id", f"r{round_num}_d0")
-            specialty = d.get("specialty", "general")
-            out_dir = f"{eval_dir}/round_{round_num}/engineer_{d_id}"
-            os.makedirs(out_dir, exist_ok=True)
+        # --- LLM step: generate code ---
+        codegen_prompt = f"""You are a GPU kernel engineer. Implement this optimization for the mmvq Q4_0 kernel on Strix Halo (gfx1151, RDNA 3.5, wave32).
 
-            # Optimize
-            runner.log(f"  Engineer {d_id} ({specialty})...")
-            eng = runner.agentT(
-                f"""You are Engineer {d_id} (specialty={specialty}) for round {round_num}.
-First create YOUR private workspace, then optimize.
-```bash
-mkdir -p {out_dir}/workspace
-( cd {canonical} && tar --exclude=./.git --exclude='*/.git' --exclude=./build --exclude='*/build' \\
-    --exclude=./__pycache__ --exclude='*/__pycache__ --exclude=./.torch_ext --exclude='*/.torch_ext' \\
-    --exclude='*.so' --exclude='*.o' -cf - . ) | ( cd {out_dir}/workspace && tar -xf - )
+## Optimization direction
+{json.dumps(direction, indent=2)}
+
+## Baseline kernel
+```cpp
+{baseline_kernel}
 ```
-Then Read {workflow_dir}/roles/engineer.md and {workflow_dir}/knowledge/self_monitoring.md and follow them.
-Save best_patch.diff via `cd <KERNEL_PATH> && git diff > {out_dir}/best_patch.diff` when geomean>1.0.
 
-## Inputs
-{json.dumps({
-    "SPECIALTY": specialty,
-    "DIRECTION": d,
-    "KERNEL_PATH": f"{out_dir}/workspace",
-    "OUTPUT_DIR": out_dir,
-    "CANONICAL": canonical,
-    "GPU_ID": gpu_ids.split(",")[0],
-    "SKILL_DIR": str(workflow_dir),
-    "BASELINE_PER_CASE": bench.get("per_case", {}),
-}, indent=2)}
+## Requirements
+1. Write a new kernel function called "mmvq_q4_0_f16_r{round_num}"
+2. Use HIP intrinsics appropriate for gfx1151 (wave32, __hfma2, uint4 loads, __shfl_xor, etc.)
+3. Keep f32 final reduction for accuracy
+4. Kernel signature: (const q4_0_block* __restrict__ A, const __half* __restrict__ x, __half* __restrict__ y, int n, int k)
+5. Use fixed-size shared memory (__shared__ not extern __shared__) — max 32KB
+6. Include the full warp reduction code
+7. Do NOT include any #include statements — just the function
 
-Return ONLY the worker_result.json structure.""",
-                {"phase": "Optimize", "label": f"eng {d_id}:{specialty}"}
+Return JSON: {{"kernel_name": "mmvq_q4_0_f16_r{round_num}", "code": "<the complete __global__ function>", "notes": "what you changed"}}
+The "code" field should contain ONLY the __global__ function definition.
+ONLY the JSON."""
+
+        codegen = runner.agent(codegen_prompt, {"label": f"r{round_num}:codegen", "timeout": 240})
+        if not codegen or not codegen.get("code"):
+            runner.log(f"Round {round_num}: codegen failed")
+            insights.append({"round": round_num, "status": "codegen_failed", "direction": direction.get("title")})
+            continue
+
+        new_kernel_code = codegen["code"]
+        runner.log(f"Round {round_num}: generated {len(new_kernel_code)} chars of kernel code")
+
+        # --- Local step: insert kernel into source file ---
+        # Append the new kernel to mmvq.hip
+        with open(kernel_src_path, "a") as f:
+            f.write(f"\n// === Round {round_num}: {direction.get('title', '')} ===\n")
+            f.write(new_kernel_code)
+            f.write("\n")
+
+        # --- Local step: update bench_driver using insertion points ---
+        driver_path = Path(task_dir) / "build" / "bench_driver.cpp"
+        driver_src = runner.read_file(str(driver_path))
+        kernel_name = codegen.get("kernel_name", f"mmvq_q4_0_f16_r{round_num}")
+
+        if kernel_name not in driver_src:
+            # Add extern declaration at EXTERN_INSERTION_POINT
+            extern_line = f'extern __global__ void {kernel_name}(const q4_0_block*, const __half*, __half*, int, int);\n'
+            driver_src = driver_src.replace(
+                "// EXTERN_INSERTION_POINT",
+                f"// EXTERN_INSERTION_POINT\n{extern_line}"
             )
 
-            if not eng or eng.get("status") == "failed":
-                runner.log(f"  Engineer {d_id}: failed")
-                continue
+            # Add benchmark + correctness check at BENCH_INSERTION_POINT
+            bench_code = f'''
+    // Round {round_num}: {direction.get('title', '')}
+    {{
+        hipMemset(d_y, 0, n * sizeof(__half));
+        dim3 block(32, 8); dim3 grid((n + 7) / 8);
+        hipLaunchKernelGGL({kernel_name}, grid, block, 0, 0, d_A, d_x, d_y, n, k);
+        check(hipMemcpy(h_y, d_y, n * sizeof(__half), hipMemcpyDeviceToHost), "cpy r{round_num}");
+        int mm = 0;
+        for (int i = 0; i < n; i++) {{
+            float diff = fabsf(__half2float(h_y[i]) - __half2float(h_y_ref[i]));
+            if (diff > 0.1f) mm++;
+        }}
+        printf("r{round_num}_correctness: %s (%d/%d mismatches)\\n", mm < n/100 ? "PASS" : "FAIL", mm, n);
+    }}
+    double r{round_num}_ms = bench_kernel({kernel_name}, d_A, d_x, d_y, n, k, 5, 50);
+    printf("r{round_num}: %.3f ms\\n", r{round_num}_ms);
+    printf("r{round_num}_speedup: %.3fx\\n", baseline_ms / r{round_num}_ms);
+'''
+            driver_src = driver_src.replace(
+                "// BENCH_INSERTION_POINT",
+                f"// BENCH_INSERTION_POINT\n{bench_code}"
+            )
 
-            speedup = eng.get("geomean_speedup", 1.0)
-            runner.log(f"  Engineer {d_id}: speedup={speedup}x")
+            runner.write_file(str(driver_path), driver_src)
 
-            if speedup > 1.0:
-                # Verify
-                runner.log(f"  Verifying {d_id}...")
-                patch = f"{out_dir}/best_patch.diff"
-                ver = runner.agentT(
-                    role_prompt(runner, "verify_engineer", "verify",
-                                "Independently re-measure this candidate patch.", {
-                                    "CANONICAL": canonical,
-                                    "PATCH": patch,
-                                    "VERIFY_DIR": f"{out_dir}/verify",
-                                    "GPU_ID": gpu_ids.split(",")[0],
-                                    "SKILL_DIR": str(workflow_dir),
-                                    "BASELINE_PER_CASE": bench.get("per_case", {}),
-                                }),
-                    {"phase": "Verify", "label": f"verify {d_id}"}
-                )
+        # --- Local step: compile + benchmark ---
+        runner.phase(f"Benchmark round {round_num}")
+        result = harness.run_benchmark()
+        if not result.get("ok"):
+            runner.log(f"Round {round_num}: compile/benchmark failed")
+            insights.append({"round": round_num, "status": "compile_failed", "direction": direction.get("title")})
+            continue
 
-                if ver and ver.get("status") == "verified" and ver.get("correctness") == "pass":
-                    verified_speedup = ver.get("geomean_speedup", 1.0)
-                    if verified_speedup > 1.0:
-                        runner.log(f"  Verified: {verified_speedup}x speedup")
-                        cumulative *= verified_speedup
-                        no_improve = 0
-                    else:
-                        runner.log(f"  Verified but no speedup")
-                        no_improve += 1
-                else:
-                    runner.log(f"  Verification failed")
-                    no_improve += 1
-            else:
-                no_improve += 1
+        # Extract the new variant's timing and correctness
+        r_ms = None
+        r_correctness = "UNKNOWN"
+        for line in result.get("raw_output", "").splitlines():
+            if line.startswith(f"r{round_num}:") and "ms" in line:
+                try:
+                    r_ms = float(line.split(":")[1].strip().replace("ms", "").strip())
+                except ValueError:
+                    pass
+            elif line.startswith(f"r{round_num}_correctness:"):
+                r_correctness = "PASS" if "PASS" in line else "FAIL"
+            elif line.startswith(f"r{round_num}_speedup:"):
+                try:
+                    speedup = float(line.split(":")[1].strip().replace("x", "").strip())
+                except ValueError:
+                    pass
 
-        if no_improve >= max_no_improve:
-            runner.log(f"Stopping: {no_improve} rounds with no improvement")
-            break
+        if r_ms is None:
+            runner.log(f"Round {round_num}: could not parse timing")
+            insights.append({"round": round_num, "status": "parse_failed", "direction": direction.get("title")})
+            continue
 
-    # === Phase: Report ===
+        speedup = baseline_ms / r_ms if r_ms > 0 else 0
+        runner.log(f"Round {round_num}: {r_ms}ms ({speedup:.2f}x vs baseline, correctness={r_correctness})")
+
+        if r_correctness != "PASS":
+            runner.log(f"Round {round_num}: CORRECTNESS FAILED, skipping")
+            insights.append({"round": round_num, "status": "correctness_failed", "direction": direction.get("title"), "ms": r_ms})
+            continue
+
+        all_variants.append({
+            "name": kernel_name,
+            "ms": r_ms,
+            "speedup": speedup,
+            "direction": direction.get("title"),
+        })
+
+        if r_ms < best_ms:
+            best_ms = r_ms
+            best_speedup = speedup
+            best_variant = kernel_name
+            runner.log(f"Round {round_num}: NEW BEST! {best_ms}ms ({best_speedup:.2f}x)")
+            insights.append({
+                "round": round_num,
+                "status": "improved",
+                "direction": direction.get("title"),
+                "ms": r_ms,
+                "speedup": speedup,
+            })
+        else:
+            runner.log(f"Round {round_num}: no improvement over best ({best_ms}ms)")
+            insights.append({
+                "round": round_num,
+                "status": "no_improve",
+                "direction": direction.get("title"),
+                "ms": r_ms,
+                "speedup": speedup,
+            })
+
+    # === Final report ===
     runner.phase("Report")
-    report = runner.agentT(
-        role_prompt(runner, "director", "report",
-                    "Write the final optimization report.", {
-                        "EVAL_DIR": eval_dir,
-                        "CUMULATIVE_SPEEDUP": cumulative,
-                        "BASELINE_GEOMEAN_MS": baseline_ms,
-                        "SKILL_DIR": str(workflow_dir),
-                    }),
-        {"phase": "Report", "label": "director:report"}
-    )
+    runner.log(f"Best variant: {best_variant} at {best_ms}ms ({best_speedup:.2f}x speedup)")
+    runner.log(f"All variants: {json.dumps(all_variants, indent=2)}")
 
-    result = {
+    return {
         "ok": True,
-        "eval_dir": eval_dir,
+        "task": task_name,
         "baseline_ms": baseline_ms,
-        "cumulative_speedup": cumulative,
+        "best_ms": best_ms,
+        "best_speedup": best_speedup,
+        "best_variant": best_variant,
+        "all_variants": all_variants,
+        "insights": insights,
         "rounds_completed": round_num,
-        "report": report,
     }
-    runner.log(f"Done. Cumulative speedup: {cumulative:.3f}x")
-    return result
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Run GEAK kernel workflow with hermes-agent")
-    parser.add_argument("kernel_path", help="Path to kernel directory")
-    parser.add_argument("--task", default="optimize", help="Task description")
-    parser.add_argument("--budget", type=int, default=4, help="Number of optimization rounds")
-    parser.add_argument("--target-language", default="triton", help="Target language")
-    parser.add_argument("--gpu-ids", default="0", help="GPU IDs")
-    parser.add_argument("--eval-dir", default=None, help="Override eval directory")
+    parser = argparse.ArgumentParser(description="Run GEAK kernel optimization with hermes-agent (local-first)")
+    parser.add_argument("task_dir", help="Path to task directory (e.g. examples/tasks/mmvq_strix)")
+    parser.add_argument("--budget", type=int, default=3, help="Number of optimization rounds")
     parser.add_argument("--model", default=None, help="Model override for hermes")
     args = parser.parse_args()
 
-    result = run_kernel_workflow(
-        kernel_path=args.kernel_path,
-        task=args.task,
+    result = run_local_optimization(
+        task_dir=args.task_dir,
         budget=args.budget,
-        target_language=args.target_language,
-        gpu_ids=args.gpu_ids,
-        eval_dir=args.eval_dir,
         model=args.model,
     )
     print(json.dumps(result, indent=2))
