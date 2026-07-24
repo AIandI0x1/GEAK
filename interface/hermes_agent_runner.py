@@ -87,6 +87,11 @@ class LocalBenchmarkHarness:
         self.build_dir.mkdir(parents=True, exist_ok=True)
         self.hipcc = os.environ.get("HIPCC", "hipcc")
         self.hip_arch = hip_arch
+        # Check for task-specific compile flags
+        self.extra_flags = []
+        flags_file = self.task_dir / "compile_flags.txt"
+        if flags_file.exists():
+            self.extra_flags = flags_file.read_text().strip().split()
 
     def compile_kernel(self, kernel_file: str = "mmvq.hip") -> tuple[bool, str]:
         """Compile a HIP kernel file to a shared library."""
@@ -108,7 +113,9 @@ class LocalBenchmarkHarness:
         exe = self.build_dir / "bench_driver"
 
         cmd = [
-            self.hipcc, f"--offload-arch={self.hip_arch}", "-O2", "-std=c++17",
+            self.hipcc, f"--offload-arch={self.hip_arch}", "-O3", "-std=gnu++17",
+            "-ffast-math", "-fPIC",
+        ] + self.extra_flags + [
             "-o", str(exe), str(driver), str(src),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -313,8 +320,19 @@ def run_local_optimization(
         return {"ok": False, "error": "cannot read kernel source"}
 
     # Extract just the baseline kernel for the prompt (keep it short)
-    baseline_match = re.search(r'(__global__ void mmvq_q4_0_f16_baseline.*?^})', kernel_source, re.DOTALL | re.MULTILINE)
-    baseline_kernel = baseline_match.group(1) if baseline_match else kernel_source[:2000]
+    baseline_match = re.search(r'(__global__\s+.*?void\s+\w*baseline\w*.*?^})', kernel_source, re.DOTALL | re.MULTILINE)
+    baseline_kernel = baseline_match.group(1) if baseline_match else kernel_source[:3000]
+
+    # Also extract the helper functions (vec_dot, codebook, scale) - they're critical context
+    helper_match = re.search(r'(static __device__.*?vec_dot_rocmfp4_q8_1.*?^})', kernel_source, re.DOTALL | re.MULTILINE)
+    helper_code = helper_match.group(1) if helper_match else ""
+
+    # Extract block definitions
+    block_defs = """
+typedef struct { uint8_t qs[16]; uint8_t e[2]; } block_rocmfp4;  // 18 bytes: 16 packed nibbles + 2 UE4M3 scales
+typedef struct { uint8_t qs[16]; uint8_t e; } block_rocmfp4_fast;  // 17 bytes: 16 packed nibbles + 1 UE4M3 scale
+typedef struct { union { struct { __half d; __half s; }; __half2 ds; }; int8_t qs[32]; } block_q8_1;  // 40 bytes
+"""
 
     best_ms = baseline_ms
     best_speedup = 1.0
@@ -360,27 +378,52 @@ ONLY the JSON."""
         runner.log(f"Round {round_num}: {direction.get('title', 'unknown')}")
 
         # --- LLM step: generate code ---
-        codegen_prompt = f"""You are a GPU kernel engineer. Implement this optimization for the mmvq Q4_0 kernel on Strix Halo (gfx1151, RDNA 3.5, wave32).
+        codegen_prompt = f"""You are a GPU kernel engineer on Strix Halo (gfx1151, RDNA 3.5, wave32).
 
 ## Optimization direction
 {json.dumps(direction, indent=2)}
 
-## Baseline kernel
+## Data structures (CRITICAL - use these exact field names)
+```cpp
+{block_defs}
+```
+
+## Baseline kernel (the REAL ROCmFP4 mmvq from llama.cpp)
 ```cpp
 {baseline_kernel}
 ```
 
-## Requirements
-1. Write a new kernel function called "mmvq_q4_0_f16_r{round_num}"
-2. Use HIP intrinsics appropriate for gfx1151 (wave32, __hfma2, uint4 loads, __shfl_xor, etc.)
-3. Keep f32 final reduction for accuracy
-4. Kernel signature: (const q4_0_block* __restrict__ A, const __half* __restrict__ x, __half* __restrict__ y, int n, int k)
-5. Use fixed-size shared memory (__shared__ not extern __shared__) — max 32KB
-6. Include the full warp reduction code
-7. Do NOT include any #include statements — just the function
+## vec_dot helper (the inner hot loop)
+```cpp
+{helper_code}
+```
 
-Return JSON: {{"kernel_name": "mmvq_q4_0_f16_r{round_num}", "code": "<the complete __global__ function>", "notes": "what you changed"}}
-The "code" field should contain ONLY the __global__ function definition.
+## Key intrinsics available on gfx1151
+- __builtin_amdgcn_sudot4(true, a, true, b, c, false) — signed int8 dot4 (4 MACs/cycle)
+- __builtin_amdgcn_perm(hi, lo, idx) — byte permute
+- __shfl_xor, __shfl_down — warp shuffle (wave32)
+- uint4 loads — 128-bit vectorized memory
+
+## CRITICAL RULES
+1. block_rocmfp4 has fields: qs[16] (packed 4-bit nibbles), e[2] (two UE4M3 scale bytes)
+2. block_rocmfp4_fast has fields: qs[16], e (one UE4M3 scale byte)
+3. block_q8_1 has fields: ds (half2, .d is delta, .s is sum), qs[32] (int8 values)
+4. Do NOT invent field names. Use ONLY the fields listed above.
+5. The scale conversion is: rocmfp4_ue4m3_to_fp32_half_finite(e[i]) — call the existing function
+6. The codebook lookup is: rocmfp4_get_int_from_codebook_16(aux_q4, nullptr) — returns int2
+7. The dot product is: ggml_cuda_dp4a(v.x, q8[l], sumi) — returns int
+
+## Requirements
+1. Write a new kernel function called "mmvq_rocmfp4_r{round_num}"
+2. Same signature as baseline: (const block_rocmfp4* A, const block_q8_1* x, float* y, int n, int k)
+3. Must produce correct results (within 0.1 tolerance vs baseline)
+4. Use fixed-size __shared__ memory (max 32KB)
+5. Include full warp reduction
+6. No #include statements — just the function
+7. You CAN call the existing helper functions (vec_dot_rocmfp4_q8_1, etc.) or write your own inner loop
+
+Return JSON: {{"kernel_name": "mmvq_rocmfp4_r{round_num}", "code": "<complete __global__ function>", "notes": "what you changed"}}
+The "code" field should contain ONLY the __global__ function.
 ONLY the JSON."""
 
         codegen = runner.agent(codegen_prompt, {"label": f"r{round_num}:codegen", "timeout": 240})
@@ -405,29 +448,44 @@ ONLY the JSON."""
         kernel_name = codegen.get("kernel_name", f"mmvq_q4_0_f16_r{round_num}")
 
         if kernel_name not in driver_src:
-            # Add extern declaration at EXTERN_INSERTION_POINT
-            extern_line = f'extern __global__ void {kernel_name}(const q4_0_block*, const __half*, __half*, int, int);\n'
+            # Extract the kernel signature from the generated code
+            # Handle __launch_bounds__, __global__, etc.
+            sig_match = re.search(r'(?:__launch_bounds__\([^)]*\)\s*)?__global__\s+.*?void\s+' + re.escape(kernel_name) + r'\s*\(([^)]+)\)', new_kernel_code)
+            if sig_match:
+                params = sig_match.group(1)
+                # Strip parameter names, keep only types for the extern
+                # Simple approach: just use the full params string
+                extern_line = f'extern __global__ void {kernel_name}({params});\n'
+            else:
+                # Fallback: copy types from the baseline extern in the driver
+                baseline_extern = re.search(r'extern __global__ void \w*baseline\w*\(([^)]+)\)', driver_src)
+                if baseline_extern:
+                    extern_line = f'extern __global__ void {kernel_name}({baseline_extern.group(1)});\n'
+                else:
+                    extern_line = f'extern __global__ void {kernel_name}(const void*, const void*, float*, int, int);\n'
+
             driver_src = driver_src.replace(
                 "// EXTERN_INSERTION_POINT",
                 f"// EXTERN_INSERTION_POINT\n{extern_line}"
             )
 
             # Add benchmark + correctness check at BENCH_INSERTION_POINT
+            # Use the same d_A, d_x, d_y that the baseline uses
             bench_code = f'''
     // Round {round_num}: {direction.get('title', '')}
     {{
-        hipMemset(d_y, 0, n * sizeof(__half));
-        dim3 block(32, 8); dim3 grid((n + 7) / 8);
+        hipMemset(d_y, 0, n * sizeof(float));
+        dim3 block(32, 2); dim3 grid(n);
         hipLaunchKernelGGL({kernel_name}, grid, block, 0, 0, d_A, d_x, d_y, n, k);
-        check(hipMemcpy(h_y, d_y, n * sizeof(__half), hipMemcpyDeviceToHost), "cpy r{round_num}");
+        check(hipMemcpy(h_y, d_y, n * sizeof(float), hipMemcpyDeviceToHost), "cpy r{round_num}");
         int mm = 0;
         for (int i = 0; i < n; i++) {{
-            float diff = fabsf(__half2float(h_y[i]) - __half2float(h_y_ref[i]));
-            if (diff > 0.1f) mm++;
+            float diff = fabsf(h_y[i] - h_y_ref[i]);
+            if (diff > 0.1f * fabsf(h_y_ref[i]) + 0.01f) mm++;
         }}
         printf("r{round_num}_correctness: %s (%d/%d mismatches)\\n", mm < n/100 ? "PASS" : "FAIL", mm, n);
     }}
-    double r{round_num}_ms = bench_kernel({kernel_name}, d_A, d_x, d_y, n, k, 5, 50);
+    double r{round_num}_ms = bench_kernel({kernel_name}, d_A, d_x, d_y, n, k, 5, 100);
     printf("r{round_num}: %.3f ms\\n", r{round_num}_ms);
     printf("r{round_num}_speedup: %.3fx\\n", baseline_ms / r{round_num}_ms);
 '''
