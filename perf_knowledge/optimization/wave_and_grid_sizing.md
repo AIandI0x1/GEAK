@@ -1,10 +1,10 @@
 ---
-title: wave and grid sizing (wave64, workgroup, launch bounds, persistent)
+title: wave and grid sizing (wave64/wave32, workgroup, launch bounds, persistent)
 kind: technique
-gens: [gfx942, gfx950]
+gens: [gfx942, gfx950, gfx1151]
 dtypes: [bf16, fp16, fp8_e4m3_fnuz, int8]
 regimes: [prefill, decode, training, both]
-updated: 2026-06-05
+updated: 2026-07-23
 sources:
   - https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html
   - https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-mi300-cdna3-instruction-set-architecture.pdf
@@ -70,3 +70,35 @@ tile→CU/XCD scheduling instead of trusting the dispatcher. See
 - Wave64, wave slots, `__launch_bounds__` semantics: AMD CDNA3 ISA reference.
 - MI300X = 304 CUs / 8 XCD; ≥1024 WG guidance: ROCm workload guide + MI300X architecture deck.
 - MI350X = 256 CUs (CU reduction, 2× per-CU matrix throughput): AMD CDNA4 whitepaper.
+
+## RDNA 3.5 / Strix Halo (gfx1151) differences
+
+**CRITICAL: RDNA 3.5 defaults to wave32, NOT wave64.** All lane math is 32-wide by default.
+See `[[hardware/rdna35_strix_halo/arch.md]]` for the full architecture overview.
+
+### Wave32 vs wave64
+- RDNA 3.5 supports **both** wave32 (default) and wave64 (opt-in)
+- Triton on RDNA maps `num_warps` to **wave32** wavefronts (not wave64 like CDNA)
+- To use wave64 on RDNA: `__attribute__((amdgpu_flat_work_group_size(64, 64)))` or compile flag
+- **Pitfall**: Kernels written for CDNA wave64 that use 64-lane shuffles/reductions MUST be adapted
+  for wave32 or explicitly forced to wave64. A wave64 kernel running in wave32 mode will produce
+  incorrect results or silently corrupt data.
+
+### Grid sizing for 40 CUs
+- **40 CUs** (20 SIMDs reported by torch) vs 304 on MI300X
+- Aim for **~320+ workgroups** (8 waves/CU) instead of 1024+
+- Decode (skinny GEMV): fewer SPLIT_K partitions needed (40 CUs fill faster than 304)
+- Prefill (large GEMM): large tiles still benefit from full-CU coverage, but fewer WGs needed
+
+### Memory-bound considerations
+- Unified memory bandwidth ~256 GB/s vs 5.3 TB/s on MI300X (~20x slower)
+- Most inference kernels will be **memory-bound** on Strix Halo
+- Optimize **bytes** (memory access patterns, coalescing) not FLOPs
+- GTT (system RAM) access is slower than dedicated VRAM; weights >8GB spill to GTT
+- Use `gpu-memory-utilization 0.85` (not 0.95) to leave headroom for system processes
+
+### WMMA instead of MFMA
+- RDNA 3.5 uses **WMMA** matrix instructions, not CDNA's MFMA
+- WMMA: 16x16 tiles for FP16/BF16, different register allocation (VGPRs, not AGPRs)
+- Triton-AMD backend supports WMMA on RDNA
+- HIP kernels: use `wmma_f16_16x16x16` not `mfma_f16_16x16x16`
