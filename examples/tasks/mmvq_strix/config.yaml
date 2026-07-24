@@ -1,0 +1,16 @@
+source_file_path:
+- src/mmvq.hip
+target_kernel_functions:
+- mmvq_q4_0_f16_baseline
+compile_command:
+- python3 scripts/task_runner.py compile
+correctness_command:
+- python3 scripts/task_runner.py correctness
+performance_command:
+- python3 scripts/task_runner.py performance
+task_type: hip
+task_result_template: task_result_template_triple_output_perf.yaml
+prompt:
+  source_code: null
+  instructions: null
+  cheatsheet: null
